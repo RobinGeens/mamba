@@ -47,8 +47,10 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
+        dtype_act=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
+        self.dtype_act = dtype_act if dtype_act is not None else dtype
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -74,9 +76,7 @@ class Mamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
         # Initialize special dt projection to preserve variance at initialization
@@ -90,8 +90,7 @@ class Mamba(nn.Module):
 
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
+            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
@@ -122,7 +121,7 @@ class Mamba(nn.Module):
         Returns: same shape as hidden_states
         """
         batch, seqlen, dim = hidden_states.shape
-
+        hidden_states = hidden_states.to(self.dtype_act)
         conv_state, ssm_state = None, None
         if inference_params is not None:
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
@@ -133,16 +132,19 @@ class Mamba(nn.Module):
 
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
-            self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+            self.in_proj.weight.to(self.dtype_act) @ rearrange(hidden_states, "b l d -> d (b l)"),
             "d (b l) -> b d l",
             l=seqlen,
         )
         if self.in_proj.bias is not None:
-            xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+            # xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+            xz = xz + rearrange(self.in_proj.bias.to(self.dtype_act), "d -> d 1")
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
+        if (
+            self.use_fast_path and causal_conv1d_fn is not None and inference_params is None and False
+        ):  # Doesn't support outputting the states
             out = mamba_inner_fn(
                 xz,
                 self.conv1d.weight,
@@ -171,15 +173,15 @@ class Mamba(nn.Module):
                 assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
                     x=x,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w").to(self.dtype_act),
+                    bias=self.conv1d.bias.to(self.dtype_act),
                     activation=self.activation,
                 )
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
+            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d").to(self.dtype_act))  # (bl d)
             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
             dt = self.dt_proj.weight @ dt.t()
             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
@@ -206,8 +208,12 @@ class Mamba(nn.Module):
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
-        dtype = hidden_states.dtype
+        raise NotImplementedError
+        dtype = self.dtype_act  # hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+
+        hidden_states = hidden_states.to(dtype)
+
         xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
         x, z = xz.chunk(2, dim=-1)  # (B D)
 
@@ -215,19 +221,20 @@ class Mamba(nn.Module):
         if causal_conv1d_update is None:
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
             conv_state[:, :, -1] = x
-            x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+            x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1).to(dtype)  # (B D)
             if self.conv1d.bias is not None:
-                x = x + self.conv1d.bias
+                x = x + self.conv1d.bias.to(dtype)
             x = self.act(x).to(dtype=dtype)
         else:
             x = causal_conv1d_update(
                 x,
                 conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
+                rearrange(self.conv1d.weight, "d 1 w -> d w").to(dtype),
+                self.conv1d.bias.to(dtype),
                 self.activation,
             )
 
+        x = x.to(dtype=dtype)
         x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         # Don't add dt_bias here
@@ -254,15 +261,11 @@ class Mamba(nn.Module):
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device
-        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
-        conv_state = torch.zeros(
-            batch_size, self.d_model * self.expand, self.d_conv, device=device, dtype=conv_dtype
-        )
-        ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
+        conv_dtype = self.dtype_act  # self.conv1d.weight.dtype if dtype is None else dtype
+        conv_state = torch.zeros(batch_size, self.d_model * self.expand, self.d_conv, device=device, dtype=conv_dtype)
+        ssm_dtype = self.dtype_act  # self.dt_proj.weight.dtype if dtype is None else dtype
         # ssm_dtype = torch.float32
-        ssm_state = torch.zeros(
-            batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype
-        )
+        ssm_state = torch.zeros(batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype)
         return conv_state, ssm_state
 
     def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
@@ -274,14 +277,16 @@ class Mamba(nn.Module):
                 self.d_model * self.expand,
                 self.d_conv,
                 device=self.conv1d.weight.device,
-                dtype=self.conv1d.weight.dtype,
+                dtype=self.dtype_act,
+                # dtype=self.conv1d.weight.dtype,
             )
             ssm_state = torch.zeros(
                 batch_size,
                 self.d_model * self.expand,
                 self.d_state,
                 device=self.dt_proj.weight.device,
-                dtype=self.dt_proj.weight.dtype,
+                dtype=self.dtype_act,
+                # dtype=self.dt_proj.weight.dtype,
                 # dtype=torch.float32,
             )
             inference_params.key_value_memory_dict[self.layer_idx] = (conv_state, ssm_state)
