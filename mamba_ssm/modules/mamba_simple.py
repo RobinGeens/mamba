@@ -141,71 +141,103 @@ class Mamba(nn.Module):
             xz = xz + rearrange(self.in_proj.bias.to(self.dtype_act), "d -> d 1")
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-        # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if (
-            self.use_fast_path and causal_conv1d_fn is not None and inference_params is None and False
-        ):  # Doesn't support outputting the states
-            out = mamba_inner_fn(
-                xz,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.x_proj.weight,
-                self.dt_proj.weight,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                A,
-                None,  # input-dependent B
-                None,  # input-dependent C
-                self.D.float(),
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-            )
-        else:
-            x, z = xz.chunk(2, dim=1)
-            # Compute short convolution
-            if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-            if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                x = causal_conv1d_fn(
-                    x=x,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w").to(self.dtype_act),
-                    bias=self.conv1d.bias.to(self.dtype_act),
-                    activation=self.activation,
-                )
 
-            # We're careful here about the layout, to avoid extra transposes.
-            # We want dt to have d as the slowest moving dimension
-            # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d").to(self.dtype_act))  # (bl d)
-            dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-            dt = self.dt_proj.weight @ dt.t()
-            dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
-            B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        # In the backward pass we write dx and dz next to each other to avoid torch.cat
+        x, z = xz.chunk(2, dim=1)
+        # Compute short convolution
+        if conv_state is not None:
+            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+            conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+        if causal_conv1d_fn is None:
+            x = self.act(self.conv1d(x)[..., :seqlen])
+        else:
             assert self.activation in ["silu", "swish"]
-            y = selective_scan_fn(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                self.D.float(),
-                z=z,
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-                return_last_state=ssm_state is not None,
+            x = causal_conv1d_fn(
+                x=x,
+                weight=rearrange(self.conv1d.weight, "d 1 w -> d w").to(self.dtype_act),
+                bias=self.conv1d.bias.to(self.dtype_act),
+                activation=self.activation,
             )
-            if ssm_state is not None:
-                y, last_state = y
-                ssm_state.copy_(last_state)
-            y = rearrange(y, "b d l -> b l d")
-            out = self.out_proj(y)
+
+        # We're careful here about the layout, to avoid extra transposes.
+        # We want dt to have d as the slowest moving dimension
+        # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+        x_dbl: Tensor = self.x_proj(rearrange(x, "b d l -> (b l) d").to(self.dtype_act))  # (bl d)
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj.weight @ dt.t()
+        dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+        B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        assert self.activation in ["silu", "swish"]
+        y = self.selective_scan_seq(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.D.float(),
+            z=z,
+        )
+        if ssm_state is not None:
+            y, last_state = y
+            ssm_state.copy_(last_state)
+        y = rearrange(y, "b d l -> b l d")
+        out = self.out_proj(y)
         return out
+
+    def selective_scan_seq(self, x: Tensor, delta: Tensor, A: Tensor, B: Tensor, C: Tensor, D: Tensor, z: Tensor):
+        """
+        x : (B, L, ED)
+        Δ : (B, L, ED)
+        A : (ED, N)
+        B : (B, N, D)
+        C : (B, L, N)
+        D : (ED)
+        y : (B, L, ED)
+        """
+        _, L, _ = x.shape
+        dt = F.softplus(delta.transpose(-2, -1) + self.dt_proj.bias.float()).transpose(-2, -1)  # B, ED, L
+
+        dA = torch.exp(torch.einsum("bld,ln->bldn", dt, A))  # (B, L, ED, N)
+        dB = torch.einsum("bld,bnd->bldn", dt, B)  # (B, L, ED, N)
+        BX = dB * rearrange(x, "b l d -> b l d 1")  # (B, L, ED, N)
+
+        h = torch.zeros(x.size(0), self.d_inner, self.d_state, device=dA.device)  # (B, ED, N)
+        hs = []
+
+        for t in range(0, L):
+            h = dA[:, t] * h + BX[:, t]
+            hs.append(h)
+
+        hs = torch.stack(hs, dim=1)  # (B, L, ED, N)
+        y = torch.einsum("bldn,bln->bld", hs.to(self.dtype_act), C)  # (B, L, ED, N) @ (B, L, N, 1) -> (B, L, ED, 1)
+        y = y + D.to(self.dtype_act) * x
+        y = y * self.act(z)  # (B D)
+
+        return y, hs
+
+    # def selective_scan(
+    #     self,
+    #     x: Tensor,
+    #     dt: Tensor,
+    #     A: Tensor,
+    #     B: Tensor,
+    #     C: Tensor,
+    #     D: Tensor,
+    #     z: Tensor,
+    #     delta_bias,
+    #     delta_softplus: bool,
+    #     return_last_state: bool,
+    # ):
+    #     # Discretize A and B
+    #     dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
+    #     dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+    #     dB = torch.einsum("bd,bn->bdn", dt, B)
+    #     ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
+    #     y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
+    #     y = y + self.D.to(dtype) * x
+    #     y = y * self.act(z)  # (B D)
 
     def step(self, hidden_states, conv_state, ssm_state):
         raise NotImplementedError
@@ -246,8 +278,8 @@ class Mamba(nn.Module):
             # Discretize A and B
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             # dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
-            
-            dA = torch.einsum("bd,bn->bdn", dt, A)**2 
+
+            dA = torch.einsum("bd,bn->bdn", dt, A) ** 2
             dB = torch.einsum("bd,bn->bdn", dt, B)
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
