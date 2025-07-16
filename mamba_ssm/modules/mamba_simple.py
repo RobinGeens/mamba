@@ -245,7 +245,9 @@ class Mamba(nn.Module):
         if selective_state_update is None:
             # Discretize A and B
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
-            dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+            # dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+            
+            dA = torch.einsum("bd,bn->bdn", dt, A)**2 
             dB = torch.einsum("bd,bn->bdn", dt, B)
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
