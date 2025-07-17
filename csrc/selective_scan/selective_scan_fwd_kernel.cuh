@@ -69,6 +69,14 @@ struct Selective_Scan_fwd_kernel_traits {
     static constexpr int kSmemSize = kSmemIOSize + sizeof(typename BlockScanT::TempStorage);
 };
 
+
+// Dummy wrapper for exp2f
+// !RG this replaces the actual exp2f with a hardware model
+__device__ __forceinline__ float dummy_exp2f(float x) {
+    // return x; // Test: this gives near 0% accuracy
+    return exp2f(x);
+}
+
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
 void selective_scan_fwd_kernel(SSMParamsBase params) {
@@ -218,7 +226,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     if constexpr (!kIsComplex) {
-                        thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
+                        thread_data[i] = make_float2(dummy_exp2f(delta_vals[r][i] * A_val[r]),
                                                      !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
                         if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
