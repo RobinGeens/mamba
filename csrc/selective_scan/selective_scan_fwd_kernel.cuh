@@ -70,11 +70,49 @@ struct Selective_Scan_fwd_kernel_traits {
 };
 
 
+__device__ uint32_t float_to_bits(float f) {
+    union {
+        float f;
+        uint32_t i;
+    } u;
+    u.f = f;
+    return u.i;
+}
+
+__device__ float bits_to_float(uint32_t i) {
+    union {
+        uint32_t i;
+        float f;
+    } u;
+    u.i = i;
+    return u.f;
+}
+
 // Dummy wrapper for exp2f
 // !RG this replaces the actual exp2f with a hardware model
 __device__ __forceinline__ float dummy_exp2f(float x) {
     // return x; // Test: this gives near 0% accuracy
     return exp2f(x);
+    const float inv_ln2 = 1.44269504089f;  // 1 / ln(2)
+    const float bias = 127.0f;
+
+    float scale = inv_ln2 * x + (bias - 0.04f);
+    uint32_t scale_bits = float_to_bits(scale);
+
+    int exponent = (scale_bits >> 23) & 0xFF;
+    int exponent2 = exponent - 127;
+
+    uint32_t mantissa = scale_bits & 0x007FFFFF;
+    mantissa = mantissa | (1 << 23);
+
+    uint32_t mantissa_shifted;
+    if (exponent2 < 0)
+        mantissa_shifted = mantissa >> (-exponent2);
+    else
+        mantissa_shifted = mantissa << exponent2;
+
+    float approx = bits_to_float(mantissa_shifted);
+    return approx;
 }
 
 template<typename Ktraits>
@@ -181,9 +219,11 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
                 constexpr float kLog2e = M_LOG2E;
                 if constexpr (!kIsComplex) {
-                    A_val[r] *= kLog2e;
+                    // A_val[r] *= kLog2e;
+                    A_val[r] *= 1; // We don't need this for the exp approximation 
                 } else {
-                    A_val[r].real_ *= kLog2e;
+                    // A_val[r].real_ *= kLog2e;
+                    A_val[r].real *= 1;
                 }
             }
             // This variable holds B * C if both B and C are constant across seqlen. If only B varies
