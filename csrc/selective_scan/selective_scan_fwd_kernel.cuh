@@ -70,7 +70,7 @@ struct Selective_Scan_fwd_kernel_traits {
 };
 
 
-__device__ uint32_t float_to_bits(float f) {
+static inline __device__ uint32_t float_to_bits(float f) {
     union {
         float f;
         uint32_t i;
@@ -79,7 +79,7 @@ __device__ uint32_t float_to_bits(float f) {
     return u.i;
 }
 
-__device__ float bits_to_float(uint32_t i) {
+static inline __device__ float bits_to_float(uint32_t i) {
     union {
         uint32_t i;
         float f;
@@ -223,7 +223,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                     A_val[r] *= 1; // We don't need this for the exp approximation 
                 } else {
                     // A_val[r].real_ *= kLog2e;
-                    A_val[r].real *= 1;
+                    A_val[r].real_ *= 1;
                 }
             }
             // This variable holds B * C if both B and C are constant across seqlen. If only B varies
