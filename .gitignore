@@ -4,3 +4,8 @@ build/
 **.so
 *.hip
 *_hip.*
+
+*.tar
+Python-*
+python-*
+gcc-*

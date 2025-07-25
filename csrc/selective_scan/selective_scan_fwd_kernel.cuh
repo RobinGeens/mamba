@@ -70,7 +70,7 @@ struct Selective_Scan_fwd_kernel_traits {
 };
 
 
-__device__ uint32_t float_to_bits(float f) {
+static inline __device__ uint32_t float_to_bits(float f) {
     union {
         float f;
         uint32_t i;
@@ -79,7 +79,7 @@ __device__ uint32_t float_to_bits(float f) {
     return u.i;
 }
 
-__device__ float bits_to_float(uint32_t i) {
+static inline __device__ float bits_to_float(uint32_t i) {
     union {
         uint32_t i;
         float f;
