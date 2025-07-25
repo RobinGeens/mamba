@@ -223,7 +223,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                     A_val[r] *= 1; // We don't need this for the exp approximation 
                 } else {
                     // A_val[r].real_ *= kLog2e;
-                    A_val[r].real *= 1;
+                    A_val[r].real_ *= 1;
                 }
             }
             // This variable holds B * C if both B and C are constant across seqlen. If only B varies
