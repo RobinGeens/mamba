@@ -88,29 +88,94 @@ static inline __device__ float bits_to_float(uint32_t i) {
     return u.f;
 }
 
-// Dummy wrapper for exp2f
+// Convert __half to raw 16-bit bits
+__device__ __forceinline__ uint16_t float16_to_bits(__half h) {
+    return *((uint16_t*)(&h));
+}
+
+// Convert raw 16-bit bits to __half
+__device__ __forceinline__ __half bits_to_float16(uint16_t bits) {
+    return *((__half*)(&bits));
+}
+
+
+// Fast exponential approximation for FP16
+// __device__ __forceinline__ __half dummy_exp2f(float x) {
+//     const __half inv_ln2_f16 = __float2half(1.4427f);  // Constant in float for accuracy
+//     const __half bias_f16 = __float2half(15.0f);
+
+//     // Convert input half to float to perform higher-precision math
+    
+//     __half x_f16 = __float2half(x);
+//     __half scale_half = inv_ln2_f16 * x_f16 + bias_f16;
+
+//     // Convert back to half to get float16 representation
+//     // __half scale_half = __float2half(scale_f32);
+//     uint16_t scale_bits = float16_to_bits(scale_half);
+
+//     // Extract exponent and mantissa
+//     uint16_t exponent = (scale_bits >> 10) & 0x1F;
+//     int exponent2 = int(exponent) - int(15);
+
+//     uint16_t mantissa = scale_bits & 0x03FF;
+//     // if (exponent != 0) {
+//     //     mantissa |= (1 << 10);  // add implicit 1 for normal numbers
+//     // }
+//     if (exponent2 > 0) {
+//         mantissa |= (1 << 10);
+//     }
+//     // Shift mantissa
+//     uint16_t mantissa_shifted;
+//     if (exponent2 < int(0)) {
+//         mantissa_shifted = mantissa >> (-exponent2);
+//     } else {
+//         // if (scale_half < __float2half(0)) {
+//         //     mantissa_shifted = mantissa >> exponent2;
+//         // } else {
+//         //     mantissa_shifted = mantissa << exponent2;
+//         // }
+//         mantissa_shifted = mantissa << exponent2;
+//     }
+//     if (scale_half < __float2half(0.0f)) {
+//         return (__half(0.0f)); // Return zero for subnormal numbers
+//     }
+//     // Reinterpret bits as __half (approximate result)
+//     return bits_to_float16(mantissa_shifted);
+// }
+
+// FP32
+// Dummy wrapper for exp2f 
 // !RG this replaces the actual exp2f with a hardware model
 __device__ __forceinline__ float dummy_exp2f(float x) {
     // return x; // Test: this gives near 0% accuracy
-    return exp2f(x);
+    // return exp2f(x);
     const float inv_ln2 = 1.44269504089f;  // 1 / ln(2)
-    const float bias = 127.0f;
+    const float bias = (127.0f);
 
-    float scale = inv_ln2 * x + (bias - 0.04f);
+    float scale = inv_ln2 * x + (bias);
     uint32_t scale_bits = float_to_bits(scale);
 
     int exponent = (scale_bits >> 23) & 0xFF;
     int exponent2 = exponent - 127;
 
     uint32_t mantissa = scale_bits & 0x007FFFFF;
-    mantissa = mantissa | (1 << 23);
-
+    // mantissa = mantissa | (1 << 23); // add implicit 1 for normal numbers
+    // if (exponent2 > 0) {
+    //     mantissa |= (1 << 23);  // add implicit 1 for normal numbers not for subnormal
+    // }
+    mantissa |= (1<<23);// add implicit 1 for normal numbers
     uint32_t mantissa_shifted;
     if (exponent2 < 0)
         mantissa_shifted = mantissa >> (-exponent2);
     else
-        mantissa_shifted = mantissa << exponent2;
-
+        mantissa_shifted = (mantissa << exponent2);
+        // if (scale < 0)
+        //     mantissa_shifted = mantissa >> exponent2;
+        // else
+        //     mantissa_shifted = mantissa << exponent2;
+    if (scale < (0.0f)) {
+        return ((0.0f)); // Return zero for subnormal numbers
+    }
     float approx = bits_to_float(mantissa_shifted);
     return approx;
 }
