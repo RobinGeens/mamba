@@ -1,12 +1,12 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.tensorboard import SummaryWriter
 
 from einops import rearrange, repeat
 
@@ -115,6 +115,10 @@ class Mamba(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
+        # TensorBoard writer for profiling
+        self.writer = SummaryWriter(log_dir="runs/mamba_profile")
+        self.global_step = 0
+
     def forward(self, hidden_states, inference_params=None):
         """
         hidden_states: (B, L, D)
@@ -168,10 +172,10 @@ class Mamba(nn.Module):
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
             if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
+                x: Tensor = self.act(self.conv1d(x)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
-                x = causal_conv1d_fn(
+                x: Tensor = causal_conv1d_fn(
                     x=x,
                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w").to(self.dtype_act),
                     bias=self.conv1d.bias.to(self.dtype_act),
@@ -188,6 +192,8 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
+
+            self._profile_tensors(dt, A)
             y = selective_scan_fn(
                 x,
                 dt,
@@ -297,3 +303,27 @@ class Mamba(nn.Module):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+
+    def _profile_tensors(self, dt: Tensor, A: Tensor):
+        any_logged = False
+        if self.global_step % 1000 != 0:
+            self.global_step += 1
+            return
+
+        # This is very slow
+        tensors = {
+            # "dt": dt,
+            # "A": A,
+            "dA": torch.einsum("bld,dn->bldn", F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype)), A),
+        }
+
+        for name, tensor in tensors.items():
+            if tensor.numel() > 0:
+                self.writer.add_histogram(name, tensor, self.global_step)
+                self.writer.add_scalar(f"{name}_mean", tensor.mean(), self.global_step)
+                self.writer.add_scalar(f"{name}_std", tensor.std(), self.global_step)
+                any_logged = True
+            else:
+                print(f"Warning: {name} is empty at step {self.global_step}")
+        if any_logged:
+            self.global_step += 1
