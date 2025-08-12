@@ -70,12 +70,46 @@ struct Selective_Scan_fwd_kernel_traits {
 };
 
 
-// Dummy wrapper for exp2f
-// !RG this replaces the actual exp2f with a hardware model
-__device__ __forceinline__ float dummy_exp2f(float x) {
-    // return x; // Test: this gives near 0% accuracy
-    return exp2f(x);
+__device__ __forceinline__ uint16_t float16_to_bits(__half h) {
+    return *reinterpret_cast<uint16_t*>(&h);
 }
+
+__device__ __forceinline__ __half bits_to_float16(uint16_t bits) {
+    return *reinterpret_cast<__half*>(&bits);
+}
+
+// Hardware model to replace exp2f
+// Results will be incorrect for inputs outside of range [-inf, 11]
+__device__ __forceinline__ __half exp2f_hardware(float x) {
+    const __half inv_ln2_f16 = __float2half(1.4427f);  
+    const __half bias_f16 = __float2half(15.0f); // Tuning bias = 0
+
+    __half x_f16 = __float2half(x);
+    // NOTE this is implemented as FMA and accuracy is preserved from mul to add
+    __half scale_half = inv_ln2_f16 * x_f16 + bias_f16;
+
+    uint16_t scale_bits = float16_to_bits(scale_half);
+
+    // Extract exp and mantissa
+    uint16_t exponent = (scale_bits >> 10) & 0x1F;
+    int shift = int(exponent) - int(15);
+    uint16_t mantissa = scale_bits & 0x03FF;
+    mantissa |= (1 << 10);
+
+    uint16_t mantissa_shifted;
+    if (shift < int(0)) {
+        mantissa_shifted = mantissa >> (-shift);
+    } else {
+        mantissa_shifted = mantissa << shift;
+    }
+
+    // Return zero for subnormal numbers
+    if (scale_half < __float2half(0.0f)) {
+        return (__half(0.0f));
+    }
+    return bits_to_float16(mantissa_shifted);
+}
+
 
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
@@ -179,12 +213,14 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             for (int r = 0; r < kNRows; ++r) {
                 A_val[r] = A[state_idx * params.A_dstate_stride + r * params.A_d_stride];
                 // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
-                constexpr float kLog2e = M_LOG2E;
-                if constexpr (!kIsComplex) {
-                    A_val[r] *= kLog2e;
-                } else {
-                    A_val[r].real_ *= kLog2e;
-                }
+                // ! Not needed when using the hardware model
+                // constexpr float kLog2e = M_LOG2E;
+                // if constexpr (!kIsComplex) {
+                //     A_val[r] *= kLog2e;
+                // } else {
+                //     A_val[r].real_ *= kLog2e;
+                // }
+
             }
             // This variable holds B * C if both B and C are constant across seqlen. If only B varies
             // across seqlen, this holds C. If only C varies across seqlen, this holds B.
@@ -226,7 +262,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     if constexpr (!kIsComplex) {
-                        thread_data[i] = make_float2(dummy_exp2f(delta_vals[r][i] * A_val[r]),
+                        thread_data[i] = make_float2(exp2f_hardware(delta_vals[r][i] * A_val[r]),
                                                      !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
                         if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
@@ -234,6 +270,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                             }
                         }
                     } else {
+                        assert(false && "Complex selective_scan_fwd_kernel not implemented");
                         // Pytorch's implementation of complex exp (which calls thrust) is very slow
                         complex_t delta_a_exp = cexp2f(delta_vals[r][i] * A_val[r]);
                         weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];

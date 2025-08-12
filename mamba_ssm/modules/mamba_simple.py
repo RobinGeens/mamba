@@ -314,7 +314,7 @@ class Mamba(nn.Module):
         tensors = {
             # "dt": dt,
             # "A": A,
-            "dA": torch.einsum("bld,dn->bldn", F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype)), A),
+            # "dA": torch.einsum("bld,dn->bldn", F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype)), A),
         }
 
         for name, tensor in tensors.items():
