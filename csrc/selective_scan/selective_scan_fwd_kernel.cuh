@@ -104,12 +104,12 @@ __device__ __forceinline__ __half dummy_exp2f(float x) {
     const __half inv_ln2_f16 = __float2half(1.4427f);  // Constant in float for accuracy
     const __half bias_f16 = __float2half(15.0f);
 
-    // Convert input half to float to perform higher-precision math
+    // Convert input to FP16
     
     __half x_f16 = __float2half(x);
     __half scale_half = inv_ln2_f16 * x_f16 + bias_f16;
 
-    // Convert back to half to get float16 representation
+    // Convert to actual bits
     uint16_t scale_bits = float16_to_bits(scale_half);
 
     // Extract exponent and mantissa
